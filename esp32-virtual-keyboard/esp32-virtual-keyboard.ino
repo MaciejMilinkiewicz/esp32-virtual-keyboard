@@ -204,6 +204,7 @@ void restartSoon() {
 void setupRoutes() {
   if (apMode) {
     server.on("/setup", HTTP_POST, []() {
+      if (!authOk()) return;
       prefs.putString("ssid", server.arg("ssid"));
       prefs.putString("pass", server.arg("pass"));
       prefs.putString("webpw", server.arg("webpw"));
