@@ -43,7 +43,7 @@ uint8_t keyCode(String t) {
   for (auto &k : KEYS) if (l == k.name) return k.code;
   if (l.length() >= 2 && l[0] == 'f') {
     int n = l.substring(1).toInt();
-    if (n >= 1 && n <= 12) return KEY_F1 + n - 1;
+    if (n >= 1 && n <= 12 && l == String("f") + String(n)) return KEY_F1 + n - 1;
   }
   return 0;
 }
