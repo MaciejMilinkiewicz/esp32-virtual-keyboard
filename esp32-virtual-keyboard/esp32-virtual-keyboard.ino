@@ -51,8 +51,8 @@ uint8_t keyCode(String t) {
   for (auto &k : KEYS) if (l == k.name) return k.code;
   if (l.length() >= 2 && l[0] == 'f') {
     int n = l.substring(1).toInt();
-    if (n >= 1 && n <= 12) return KEY_F1 + n - 1;
-    if (n >= 13 && n <= 24) return KEY_F13 + n - 13;
+    if (n >= 1 && n <= 12 && l == String("f") + String(n)) return KEY_F1 + n - 1;
+    if (n >= 13 && n <= 24 && l == String("f") + String(n)) return KEY_F13 + n - 13;
   }
   return 0;
 }
@@ -139,9 +139,9 @@ String readFile(const String &p) {
 bool writeFile(const String &p, const String &d) {
   File f = LittleFS.open(p, "w");
   if (!f) return false;
-  f.print(d);
+  size_t written = f.print(d);
   f.close();
-  return true;
+  return written == d.length();
 }
 
 String listMacros() {
@@ -184,6 +184,7 @@ void importConfig(const String &d) {
   String curName;
   String body;
   bool inMacro = false;
+  int blockKind = 0;  // 0 makro, 1 harmonogram, 2 wejścia
   int p = 0;
   while (p < (int)d.length()) {
     int e = d.indexOf('\n', p);
@@ -193,19 +194,22 @@ void importConfig(const String &d) {
     p = e + 1;
     if (inMacro) {
       if (line == "@@end") {
-        if (curName == "\x01sched") writeFile(SCHED_FILE, body);
-        else if (curName == "\x01inputs") writeFile(INPUTS_FILE, body);
+        if (blockKind == 1) writeFile(SCHED_FILE, body);
+        else if (blockKind == 2) writeFile(INPUTS_FILE, body);
         else if (validName(curName)) writeFile(macroPath(curName), body);
         inMacro = false;
-      } else body += line + "\n";
+      } else if (blockKind || validName(curName)) {
+        body += line + "\n";
+      }
     } else if (line == "@@sched" || line == "@@inputs") {
-      curName = line == "@@sched" ? "\x01sched" : "\x01inputs";
+      blockKind = line == "@@sched" ? 1 : 2;
       body = "";
       inMacro = true;
     } else if (line.startsWith("@@macro ")) {
       curName = line.substring(8);
       curName.trim();
       body = "";
+      blockKind = 0;
       inMacro = true;  // nieprawidłowa nazwa jest pomijana przy @@end
     } else if (line.startsWith("ssid=")) prefs.putString("ssid", line.substring(5));
     else if (line.startsWith("pass=")) prefs.putString("pass", line.substring(5));
@@ -392,6 +396,7 @@ void restartSoon() {
 void setupRoutes() {
   if (apMode) {
     server.on("/setup", HTTP_POST, []() {
+      if (!authOk()) return;
       prefs.putString("ssid", server.arg("ssid"));
       prefs.putString("pass", server.arg("pass"));
       prefs.putString("webpw", server.arg("webpw"));

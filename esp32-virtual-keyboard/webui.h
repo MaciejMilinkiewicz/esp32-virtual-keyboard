@@ -83,7 +83,7 @@ async function load(){
  for(const n of t.split('\n').filter(x=>x)){
   const li=document.createElement('li');const s=document.createElement('span');s.textContent=n;li.append(s);
   for(const [l,f] of [['uruchom',()=>run(n)],['edytuj',()=>edit(n)],['usuń',()=>del(n)]]){
-   const a=document.createElement('a');a.textContent=l;a.onclick=f;li.append(a)}
+   const a=document.createElement('button');a.type='button';a.textContent=l;a.onclick=f;li.append(a)}
   ul.append(li)}
 }
 async function run(n){const r=await fetch('/run/'+encodeURIComponent(n));say(r.ok?'Wykonano':'Błąd')}
