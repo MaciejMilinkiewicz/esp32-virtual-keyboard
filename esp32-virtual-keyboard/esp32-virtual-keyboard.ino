@@ -124,9 +124,9 @@ String readFile(const String &p) {
 bool writeFile(const String &p, const String &d) {
   File f = LittleFS.open(p, "w");
   if (!f) return false;
-  f.print(d);
+  size_t written = f.print(d);
   f.close();
-  return true;
+  return written == d.length();
 }
 
 String listMacros() {
