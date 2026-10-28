@@ -20,7 +20,7 @@ textarea,input{width:100%;box-sizing:border-box;padding:.5em;margin:.3em 0;font-
 textarea{height:14em}.sec{display:none}.sec.on{display:block}
 li{margin:.3em 0}a{cursor:pointer;color:#06c;margin-left:.6em}#msg{color:#080;min-height:1.2em}
 </style></head><body>
-<nav><button data-t="m">Makro</button><button data-t="k">Klawiatura</button><button data-t="s">Ustawienia</button></nav>
+<nav><button data-t="m">Makro</button><button data-t="k">Klawiatura</button><button data-t="h">Harmonogram</button><button data-t="i">Wejścia</button><button data-t="s">Ustawienia</button></nav>
 <div id="msg"></div>
 
 <div id="m" class="sec">
@@ -31,7 +31,8 @@ li{margin:.3em 0}a{cursor:pointer;color:#06c;margin-left:.6em}#msg{color:#080;mi
 <button onclick="saveM()">Zapisz</button> <button onclick="clearM()">Nowe</button>
 <details><summary>Format</summary><pre>Jedna linia = jeden znak lub kombinacja (łączone znakiem +).
 ctrl sh alt win bs sp cr tab esc up down left right home end del ins pgup pgdn
-f1..f12 power sleep
+f1..f24 power sleep
+pin39up / pin39down - stan wyjścia GPIO 39 37 35 33 18 16
 pause N  - zwłoka w sekundach
 Linia dłuższa bez + i nie będąca klawiszem jest wpisywana jako tekst.
 Wywołanie: /run/NAZWA</pre></details>
@@ -43,11 +44,26 @@ Wywołanie: /run/NAZWA</pre></details>
 <button onclick="typeK()">Wyślij</button>
 </div>
 
+<div id="h" class="sec">
+<h3>Harmonogram (cron: min godz dzień mies dzień_tyg)</h3><ul id="hl"></ul>
+<input id="hc" placeholder="np. */5 8-16 * * 1-5">
+<select id="hm"></select> <button onclick="addH()">Dodaj</button>
+</div>
+
+<div id="i" class="sec">
+<h3>Wejścia</h3><pre id="ist"></pre><ul id="il"></ul>
+<select id="is"></select>
+<select id="ie"><option value="fall">zbocze opadające (1→0)</option><option value="rise">zbocze narastające (0→1)</option><option value="change">każda zmiana</option></select>
+<select id="im"></select> <button onclick="addI()">Dodaj</button>
+</div>
+
 <div id="s" class="sec">
 <h3>Ustawienia</h3>
 <label>WiFi SSID</label><input id="ssid">
 <label>Hasło WiFi (puste = bez zmian)</label><input id="pass" type="password">
 <label>Hasło WebUI (puste = bez zmian)</label><input id="webpw" type="password">
+<label>Serwer NTP</label><input id="ntp">
+<label>Strefa czasowa (POSIX TZ)</label><input id="tz">
 <label><input type="checkbox" id="nopw" style="width:auto"> Usuń hasło WebUI</label><br>
 <button onclick="saveS()">Zapisz ustawienia i uruchom ponownie</button>
 <h4>Konfiguracja w pliku</h4>
@@ -76,7 +92,17 @@ async function del(n){if(confirm('Usunąć '+n+'?')){await post('/api/macro/del'
 function clearM(){$('mn').value='';$('mb').value=''}
 async function saveM(){const r=await post('/api/macro',{n:$('mn').value,b:$('mb').value});say(r.ok?'Zapisano':'Błąd nazwy');load()}
 async function typeK(){const r=await post('/api/type',{t:$('kt').value});say(r.ok?'Wysłano':'Błąd')}
-async function saveS(){await post('/api/settings',{ssid:$('ssid').value,pass:$('pass').value,webpw:$('webpw').value,nopw:$('nopw').checked?1:0});say('Zapisano, restart...')}
+async function saveS(){await post('/api/settings',{ntp:$('ntp').value,tz:$('tz').value,ssid:$('ssid').value,pass:$('pass').value,webpw:$('webpw').value,nopw:$('nopw').checked?1:0});say('Zapisano, restart...')}
 async function impF(){const f=$('imp').files[0];if(!f)return;const r=await post('/api/import',{d:await f.text()});say(r.ok?'Wgrano, restart...':'Błąd')}
-(async()=>{tab('m');load();$('ssid').value=await (await fetch('/api/ssid')).text()})();
+function rows(t){return t.split('\n').filter(x=>x)}
+function fillSel(id,vals){$(id).innerHTML='';for(const v of vals){const o=document.createElement('option');o.textContent=v;o.value=v;$(id).append(o)}}
+function listRows(ul,lines,delFn){ul.innerHTML='';lines.forEach((l,i)=>{const li=document.createElement('li');const s=document.createElement('span');s.textContent=l.split('|').join('  ');li.append(s);const a=document.createElement('a');a.textContent='usuń';a.onclick=()=>delFn(i);li.append(a);ul.append(li)})}
+async function loadH(){fillSel('hm',rows(await (await fetch('/api/macros')).text()));listRows($('hl'),rows(await (await fetch('/api/sched')).text()),async i=>{await post('/api/sched/del',{i});loadH()})}
+async function addH(){const r=await post('/api/sched/add',{c:$('hc').value,m:$('hm').value});say(r.ok?'Dodano':'Błędny cron lub makro');loadH()}
+async function loadI(){fillSel('is',['3','5','7','9','11','12','scroll']);fillSel('im',rows(await (await fetch('/api/macros')).text()));
+ $('ist').textContent=rows(await (await fetch('/api/inputs/state')).text()).join('   ');
+ listRows($('il'),rows(await (await fetch('/api/inputs')).text()),async i=>{await post('/api/inputs/del',{i});loadI()})}
+async function addI(){const r=await post('/api/inputs/add',{s:$('is').value,e:$('ie').value,m:$('im').value});say(r.ok?'Dodano':'Błąd');loadI()}
+const _tab=tab;tab=function(t){_tab(t);if(t=='h')loadH();if(t=='i')loadI()};
+(async()=>{tab('m');load();const nt=(await (await fetch('/api/ntp')).text()).split('\n');$('ntp').value=nt[0];$('tz').value=nt[1]||'';$('ssid').value=await (await fetch('/api/ssid')).text()})();
 </script></body></html>)HTML";

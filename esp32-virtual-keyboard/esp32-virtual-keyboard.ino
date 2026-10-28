@@ -10,11 +10,19 @@
 #include <USB.h>
 #include <USBHIDKeyboard.h>
 #include <USBHIDSystemControl.h>
+#include <time.h>
 #include "webui.h"
 
 #define BUTTON_PIN 0
 #define AP_NAME "ESP-Keyboard-Setup"
 #define MACRO_DIR "/m"
+
+const uint8_t IN_PINS[] = {3, 5, 7, 9, 11, 12};
+const uint8_t OUT_PINS[] = {39, 37, 35, 33, 18, 16};
+#define SCHED_FILE "/sched.txt"
+#define INPUTS_FILE "/inputs.txt"
+#define DEFAULT_NTP "pool.ntp.org"
+#define DEFAULT_TZ "CET-1CEST,M3.5.0,M10.5.0/3"
 
 USBHIDKeyboard Keyboard;
 USBHIDSystemControl SystemControl;
@@ -44,6 +52,7 @@ uint8_t keyCode(String t) {
   if (l.length() >= 2 && l[0] == 'f') {
     int n = l.substring(1).toInt();
     if (n >= 1 && n <= 12) return KEY_F1 + n - 1;
+    if (n >= 13 && n <= 24) return KEY_F13 + n - 13;
   }
   return 0;
 }
@@ -67,6 +76,12 @@ void runLine(String line) {
   String l = line;
   l.toLowerCase();
   if (l.startsWith("pause ")) { delaySeconds(l.substring(6).toInt()); return; }
+  if (l.startsWith("pin") && (l.endsWith("up") || l.endsWith("down"))) {
+    bool up = l.endsWith("up");
+    int n = l.substring(3, l.length() - (up ? 2 : 4)).toInt();
+    for (uint8_t o : OUT_PINS) if (o == n) { digitalWrite(o, up ? HIGH : LOW); return; }
+    return;
+  }
   if (l == "power") { sendSystem(SYSTEM_CONTROL_POWER_OFF); return; }
   if (l == "sleep") { sendSystem(SYSTEM_CONTROL_STANDBY); return; }
 
@@ -148,6 +163,10 @@ String exportConfig() {
   String s = "ssid=" + prefs.getString("ssid", "") + "\n";
   s += "pass=" + prefs.getString("pass", "") + "\n";
   s += "webpw=" + prefs.getString("webpw", "") + "\n";
+  s += "ntp=" + prefs.getString("ntp", DEFAULT_NTP) + "\n";
+  s += "tz=" + prefs.getString("tz", DEFAULT_TZ) + "\n";
+  s += "@@sched\n" + readFile(SCHED_FILE) + "@@end\n";
+  s += "@@inputs\n" + readFile(INPUTS_FILE) + "@@end\n";
   String names = listMacros();
   int p = 0;
   while (p < (int)names.length()) {
@@ -173,17 +192,186 @@ void importConfig(const String &d) {
     line.replace("\r", "");
     p = e + 1;
     if (inMacro) {
-      if (line == "@@end") { writeFile(macroPath(curName), body); inMacro = false; }
-      else body += line + "\n";
+      if (line == "@@end") {
+        if (curName == "\x01sched") writeFile(SCHED_FILE, body);
+        else if (curName == "\x01inputs") writeFile(INPUTS_FILE, body);
+        else if (validName(curName)) writeFile(macroPath(curName), body);
+        inMacro = false;
+      } else body += line + "\n";
+    } else if (line == "@@sched" || line == "@@inputs") {
+      curName = line == "@@sched" ? "\x01sched" : "\x01inputs";
+      body = "";
+      inMacro = true;
     } else if (line.startsWith("@@macro ")) {
       curName = line.substring(8);
       curName.trim();
       body = "";
-      inMacro = validName(curName);
-      if (!inMacro) { /* pomiń nieprawidłową nazwę do @@end */ }
+      inMacro = true;  // nieprawidłowa nazwa jest pomijana przy @@end
     } else if (line.startsWith("ssid=")) prefs.putString("ssid", line.substring(5));
     else if (line.startsWith("pass=")) prefs.putString("pass", line.substring(5));
     else if (line.startsWith("webpw=")) prefs.putString("webpw", line.substring(6));
+    else if (line.startsWith("ntp=")) prefs.putString("ntp", line.substring(4));
+    else if (line.startsWith("tz=")) prefs.putString("tz", line.substring(3));
+  }
+}
+
+// ---------- harmonogram (cron) i wejścia ----------
+// /sched.txt:  "<cron 5 pól>|<makro>" w linii
+// /inputs.txt: "<źródło>|<zbocze>|<makro>", źródło: 3 5 7 9 11 12 lub scroll,
+//              zbocze: fall (1->0), rise (0->1), change
+
+volatile bool scrollLock = false;
+
+bool cronField(String f, int v, int lo, int hi) {
+  int start = 0;
+  while (start <= (int)f.length()) {
+    int c = f.indexOf(',', start);
+    if (c < 0) c = f.length();
+    String part = f.substring(start, c);
+    start = c + 1;
+    int step = 1;
+    int sl = part.indexOf('/');
+    if (sl >= 0) { step = part.substring(sl + 1).toInt(); part = part.substring(0, sl); }
+    if (step < 1) continue;
+    int a = lo, b = hi;
+    if (part != "*") {
+      int d = part.indexOf('-');
+      if (d >= 0) { a = part.substring(0, d).toInt(); b = part.substring(d + 1).toInt(); }
+      else { a = part.toInt(); b = sl >= 0 ? hi : a; }
+    }
+    if (v >= a && v <= b && (v - a) % step == 0) return true;
+  }
+  return false;
+}
+
+bool cronValid(const String &expr) {
+  int n = 0;
+  for (int i = 0; i < (int)expr.length(); i++) {
+    char c = expr[i];
+    if (c == ' ') { if (i && expr[i - 1] != ' ') n++; }
+    else if (!isdigit(c) && c != '*' && c != '/' && c != ',' && c != '-') return false;
+  }
+  if (expr.length() && expr[expr.length() - 1] != ' ') n++;
+  return n == 5;
+}
+
+bool cronMatch(const String &expr, const struct tm &t) {
+  String f[5];
+  int n = 0;
+  String e = expr;
+  e.trim();
+  while (e.length() && n < 5) {
+    int sp = e.indexOf(' ');
+    if (sp < 0) sp = e.length();
+    f[n++] = e.substring(0, sp);
+    e = e.substring(sp);
+    e.trim();
+  }
+  if (n != 5) return false;
+  bool dow = cronField(f[4], t.tm_wday, 0, 7) || (t.tm_wday == 0 && cronField(f[4], 7, 0, 7));
+  return cronField(f[0], t.tm_min, 0, 59) && cronField(f[1], t.tm_hour, 0, 23) &&
+         cronField(f[2], t.tm_mday, 1, 31) && cronField(f[3], t.tm_mon + 1, 1, 12) && dow;
+}
+
+String field(const String &line, int idx) {
+  int s = 0;
+  for (int i = 0; i < idx; i++) {
+    s = line.indexOf('|', s);
+    if (s < 0) return "";
+    s++;
+  }
+  int e = line.indexOf('|', s);
+  return line.substring(s, e < 0 ? line.length() : e);
+}
+
+void runNamed(const String &n) {
+  if (validName(n) && LittleFS.exists(macroPath(n))) runMacro(readFile(macroPath(n)));
+}
+
+// Zwraca plik bez linii o danym indeksie (idx < 0: bez zmian).
+String withoutLine(const String &data, int idx) {
+  String out;
+  int s = 0, i = 0;
+  while (s < (int)data.length()) {
+    int e = data.indexOf('\n', s);
+    if (e < 0) e = data.length();
+    if (i++ != idx) out += data.substring(s, e) + "\n";
+    s = e + 1;
+  }
+  return out;
+}
+
+bool inputSourceValid(const String &src) {
+  if (src == "scroll") return true;
+  for (uint8_t p : IN_PINS) if (src == String(p)) return true;
+  return false;
+}
+
+int readInput(const String &src) {
+  if (src == "scroll") return scrollLock ? 1 : 0;
+  return digitalRead(src.toInt());
+}
+
+String inputStates() {
+  String s;
+  for (uint8_t p : IN_PINS) s += String(p) + "=" + digitalRead(p) + "\n";
+  s += "scroll=" + String(scrollLock ? 1 : 0) + "\n";
+  return s;
+}
+
+void onKeyboardLed(void *, esp_event_base_t, int32_t, void *data) {
+  auto *d = (arduino_usb_hid_keyboard_event_data_t *)data;
+  scrollLock = d->leds & LED_SCROLLLOCK;
+}
+
+void pollInputs() {
+  static int last[7];
+  static bool init = false;
+  static unsigned long lastPoll = 0;
+  if (millis() - lastPoll < 20) return;
+  lastPoll = millis();
+  String srcs[7];
+  for (int i = 0; i < 6; i++) srcs[i] = String(IN_PINS[i]);
+  srcs[6] = "scroll";
+  for (int i = 0; i < 7; i++) {
+    int v = readInput(srcs[i]);
+    if (!init) { last[i] = v; continue; }
+    if (v == last[i]) continue;
+    bool rising = v > last[i];
+    last[i] = v;
+    String data = readFile(INPUTS_FILE);
+    int s = 0;
+    while (s < (int)data.length()) {
+      int e = data.indexOf('\n', s);
+      if (e < 0) e = data.length();
+      String line = data.substring(s, e);
+      s = e + 1;
+      if (field(line, 0) != srcs[i]) continue;
+      String edge = field(line, 1);
+      if (edge == "change" || (edge == "rise" && rising) || (edge == "fall" && !rising))
+        runNamed(field(line, 2));
+    }
+  }
+  init = true;
+}
+
+void pollSchedule() {
+  static int lastMinute = -1;
+  time_t now = time(nullptr);
+  if (now < 1700000000) return;  // czas jeszcze niezsynchronizowany
+  struct tm t;
+  localtime_r(&now, &t);
+  int key = t.tm_yday * 1440 + t.tm_hour * 60 + t.tm_min;
+  if (key == lastMinute) return;
+  lastMinute = key;
+  String data = readFile(SCHED_FILE);
+  int s = 0;
+  while (s < (int)data.length()) {
+    int e = data.indexOf('\n', s);
+    if (e < 0) e = data.length();
+    String line = data.substring(s, e);
+    s = e + 1;
+    if (cronMatch(field(line, 0), t)) runNamed(field(line, 1));
   }
 }
 
@@ -257,10 +445,54 @@ void setupRoutes() {
     if (!authOk()) return;
     prefs.putString("ssid", server.arg("ssid"));
     if (server.arg("pass").length()) prefs.putString("pass", server.arg("pass"));
+    if (server.arg("ntp").length()) prefs.putString("ntp", server.arg("ntp"));
+    if (server.arg("tz").length()) prefs.putString("tz", server.arg("tz"));
     if (server.arg("nopw") == "1") prefs.putString("webpw", "");
     else if (server.arg("webpw").length()) prefs.putString("webpw", server.arg("webpw"));
     server.send(200, "text/plain", "ok");
     restartSoon();
+  });
+  server.on("/api/sched", HTTP_GET, []() {
+    if (authOk()) server.send(200, "text/plain; charset=utf-8", readFile(SCHED_FILE));
+  });
+  server.on("/api/sched/add", HTTP_POST, []() {
+    if (!authOk()) return;
+    String c = server.arg("c"), m = server.arg("m");
+    c.trim();
+    if (!cronValid(c) || !validName(m)) { server.send(400, "text/plain", "bad"); return; }
+    writeFile(SCHED_FILE, readFile(SCHED_FILE) + c + "|" + m + "\n");
+    server.send(200, "text/plain", "ok");
+  });
+  server.on("/api/sched/del", HTTP_POST, []() {
+    if (!authOk()) return;
+    writeFile(SCHED_FILE, withoutLine(readFile(SCHED_FILE), server.arg("i").toInt()));
+    server.send(200, "text/plain", "ok");
+  });
+  server.on("/api/inputs", HTTP_GET, []() {
+    if (authOk()) server.send(200, "text/plain; charset=utf-8", readFile(INPUTS_FILE));
+  });
+  server.on("/api/inputs/state", HTTP_GET, []() {
+    if (authOk()) server.send(200, "text/plain", inputStates());
+  });
+  server.on("/api/inputs/add", HTTP_POST, []() {
+    if (!authOk()) return;
+    String src = server.arg("s"), ed = server.arg("e"), m = server.arg("m");
+    if (!inputSourceValid(src) || !(ed == "fall" || ed == "rise" || ed == "change") || !validName(m)) {
+      server.send(400, "text/plain", "bad");
+      return;
+    }
+    writeFile(INPUTS_FILE, readFile(INPUTS_FILE) + src + "|" + ed + "|" + m + "\n");
+    server.send(200, "text/plain", "ok");
+  });
+  server.on("/api/inputs/del", HTTP_POST, []() {
+    if (!authOk()) return;
+    writeFile(INPUTS_FILE, withoutLine(readFile(INPUTS_FILE), server.arg("i").toInt()));
+    server.send(200, "text/plain", "ok");
+  });
+  server.on("/api/ntp", HTTP_GET, []() {
+    if (authOk())
+      server.send(200, "text/plain; charset=utf-8",
+                  prefs.getString("ntp", DEFAULT_NTP) + "\n" + prefs.getString("tz", DEFAULT_TZ));
   });
   server.on("/api/export", HTTP_GET, []() {
     if (authOk()) server.send(200, "text/plain; charset=utf-8", exportConfig());
@@ -300,6 +532,9 @@ bool connectWifi(const String &ssid, const String &pass) {
 
 void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  for (uint8_t p : IN_PINS) pinMode(p, INPUT_PULLUP);
+  for (uint8_t p : OUT_PINS) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
+  Keyboard.onEvent(ARDUINO_USB_HID_KEYBOARD_LED_EVENT, onKeyboardLed);
   Keyboard.begin();
   SystemControl.begin();
   USB.begin();
@@ -311,6 +546,8 @@ void setup() {
   webPw = prefs.getString("webpw", "");
   if (!ssid.length() || !connectWifi(ssid, prefs.getString("pass", ""))) startPortal();
 
+  if (!apMode) configTzTime(prefs.getString("tz", DEFAULT_TZ).c_str(),
+                            prefs.getString("ntp", DEFAULT_NTP).c_str());
   setupRoutes();
   server.begin();
 }
@@ -318,6 +555,10 @@ void setup() {
 void loop() {
   if (apMode) dns.processNextRequest();
   server.handleClient();
+  if (!apMode) {
+    pollInputs();
+    pollSchedule();
+  }
 
   static unsigned long pressed = 0;
   if (digitalRead(BUTTON_PIN) == LOW) {
