@@ -173,14 +173,17 @@ void importConfig(const String &d) {
     line.replace("\r", "");
     p = e + 1;
     if (inMacro) {
-      if (line == "@@end") { writeFile(macroPath(curName), body); inMacro = false; }
-      else body += line + "\n";
+      if (line == "@@end") {
+        if (validName(curName)) writeFile(macroPath(curName), body);
+        inMacro = false;
+      } else if (validName(curName)) {
+        body += line + "\n";
+      }
     } else if (line.startsWith("@@macro ")) {
       curName = line.substring(8);
       curName.trim();
       body = "";
-      inMacro = validName(curName);
-      if (!inMacro) { /* pomiń nieprawidłową nazwę do @@end */ }
+      inMacro = true;
     } else if (line.startsWith("ssid=")) prefs.putString("ssid", line.substring(5));
     else if (line.startsWith("pass=")) prefs.putString("pass", line.substring(5));
     else if (line.startsWith("webpw=")) prefs.putString("webpw", line.substring(6));
